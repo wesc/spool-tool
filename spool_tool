@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+
+import os
+import time
+import uuid
+import logging
+import argparse
+import urllib.parse
+from datetime import datetime
+from functools import partial
+
+import boto3
+
+
+class SpoolToolError(Exception):
+    pass
+
+
+def find_files(dir, min_modified):
+    """Returns iterator of DIR's contents, dropping files newer than
+    MIN_MODIFIED minutes.
+
+    """
+
+    try:
+        files = os.listdir(dir)
+    except FileNotFoundError:
+        logger.error("directory doesn't exist: %s", dir)
+        return
+
+    if not files:
+        logger.info("directory empty: %s", dir)
+        return
+
+    right_now = time.time()
+    for f in files:
+        abspath = os.path.join(dir, f)
+        if not os.path.isfile(abspath):
+            logger.info("not a file, skipping: %s", f)
+            continue
+
+        s = os.stat(abspath)
+        if s.st_mtime > right_now - min_modified * 60:
+            logger.info("file too fresh, skipping: %s", f)
+            continue
+
+        yield f, s.st_mtime
+
+
+def format(fstr, fname, fstat, spool_dir):
+    """Format fstr according to the supplied filename and file stat info.
+
+    """
+
+    mtime = datetime.utcfromtimestamp(fstat.st_mtime)
+    ctime = datetime.utcfromtimestamp(fstat.st_ctime)
+    now = time.time()
+    return fstr.format(
+        m_YYYY="%04d" % mtime.year,
+        m_MM="%02d" % mtime.month,
+        m_DD="%02d" % mtime.day,
+        m_hh="%02d" % mtime.hour,
+        m_mm="%02d" % mtime.minute,
+        m_ss="%02d" % mtime.second,
+        c_YYYY="%04d" % ctime.year,
+        c_MM="%02d" % ctime.month,
+        c_DD="%02d" % ctime.day,
+        c_hh="%02d" % ctime.hour,
+        c_mm="%02d" % ctime.minute,
+        c_ss="%02d" % ctime.second,
+        now=int(now),
+        fname=fname,
+        uuid1=uuid.uuid1(),
+        uuid4=uuid.uuid4(),
+        spool_dir=spool_dir.strip("/"),
+    )
+
+
+def noop_uploader(parts, spool_dir, finput, foutput):
+    logger.info("noop upload: %s -> %s", os.path.join(spool_dir, finput), foutput)
+    return True
+
+
+def s3_uploader(parts, spool_dir, finput, foutput):
+    bucket = parts.netloc
+    path = parts.path
+    # force path to be a directory
+    path = path.strip("/") + "/"
+
+    dest = path + foutput
+    logger.info("s3 upload: %s -> bucket '%s', path '%s'", finput, bucket, dest)
+    s3_client = boto3.client("s3")
+    s3_client.upload_file(os.path.join(spool_dir, finput), bucket, dest)
+
+    return True
+
+
+def upload_phase(args, spool_dir):
+    uploaders = {
+        "noop": noop_uploader,
+        "s3": s3_uploader,
+    }
+    new_dir = os.path.join(spool_dir, "new")
+    completed_dir = os.path.join(spool_dir, "completed")
+
+    logger.info("running upload...")
+    logger.info("supported upload schemes: %s", ", ".join(sorted(uploaders.keys())))
+    logger.info("new directory: %s", new_dir)
+    logger.info("completed directory: %s", completed_dir)
+
+    if args.dest == "noop":
+        args.dest = "noop://"
+    uri_parts = urllib.parse.urlparse(args.dest)
+    if uri_parts.scheme not in uploaders:
+        raise SpoolToolError("unknown upload scheme '%s'" % args.dest)
+
+    uploader = partial(uploaders[uri_parts.scheme], uri_parts)
+    for fname, mtime in find_files(new_dir, args.hold_for):
+        logger.info(
+            "discovered: %s, last modified %s",
+            fname,
+            datetime.utcfromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+        source_path = os.path.join(new_dir, fname)
+        completed_path = os.path.join(completed_dir, fname)
+
+        if args.format:
+            foutput = format(args.format, fname, os.stat(source_path), spool_dir)
+        else:
+            foutput = fname
+
+        try:
+            status = uploader(new_dir, fname, foutput)
+        except Exception:
+            logger.exception("")
+            status = False
+
+        if not status:
+            logger.info("upload failed: %s", fname)
+            continue
+
+        logger.info("upload ok: %s", fname)
+        try:
+            os.rename(source_path, completed_path)
+            logger.info("mark complete: %s", fname)
+        except OSError:
+            logger.exception("mark failed: %s", fname)
+            continue
+
+
+def cleanup_phase(args, spool_dir):
+    logger.info("running cleanup...")
+    completed_dir = os.path.join(spool_dir, "completed")
+    if os.path.isdir(spool_dir):
+        # don't create the spool_dir if it doesn't already exist
+        os.makedirs(completed_dir, exist_ok=True)
+
+    for fname, mtime in find_files(completed_dir, args.delete_after):
+        try:
+            abspath = os.path.join(completed_dir, fname)
+            os.remove(abspath)
+            logger.info("delete ok: %s", abspath)
+        except:
+            logger.exception("delete failed: %s", abspath)
+            continue
+
+
+def main(args):
+    logger.info("running %s", vars(args))
+    rounds = 0
+    while True:
+        for spool_dir in args.spool_dir:
+            upload_phase(args, spool_dir)
+            cleanup_phase(args, spool_dir)
+
+        if not args.loop:
+            break
+
+        rounds += 1
+        if args.loop != -1 and rounds >= args.loop:
+            logger.info("reached loop max: %d", args.loop)
+            break
+
+        logger.info("sleeping: %d minute(s)", args.period)
+        logger.info("")
+        time.sleep(args.period * 60)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Watch directory and upload files to external location."
+    )
+    parser.add_argument("spool_dir", help="spool directories", type=str, nargs="+")
+    parser.add_argument(
+        "--hold-for",
+        help="wait for N minutes before uploading",
+        type=int,
+        default=0,
+        required=False,
+    )
+    parser.add_argument(
+        "--delete-after",
+        help="delete completed files after N minutes",
+        type=int,
+        default=60,
+        required=False,
+    )
+    parser.add_argument("--dest", help="destination URI", type=str, required=True)
+    parser.add_argument(
+        "--format", help="format filename before uploading", type=str, required=False,
+    )
+    parser.add_argument(
+        "--loop", help="loop N times (use -1 to loop forever)", type=int, required=False
+    )
+    parser.add_argument(
+        "--period",
+        help="wait N minutes before runs",
+        type=int,
+        default=1,
+        required=False,
+    )
+    parser.add_argument("--loglevel", help="log level", type=str, default="INFO")
+
+    args = parser.parse_args()
+
+    logger = logging.getLogger("spool_tool")
+    logger.setLevel(args.loglevel.upper())
+    ch = logging.StreamHandler()
+    ch.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logger.addHandler(ch)
+
+    main(args)
