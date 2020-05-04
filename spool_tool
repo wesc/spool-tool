@@ -95,18 +95,16 @@ def s3_uploader(parts, spool_dir, finput, foutput):
     return True
 
 
-def upload_phase(args, spool_dir):
+def upload_phase(args):
     uploaders = {
         "noop": noop_uploader,
         "s3": s3_uploader,
     }
-    new_dir = os.path.join(spool_dir, "new")
-    completed_dir = os.path.join(spool_dir, "completed")
 
     logger.info("running upload...")
     logger.info("supported upload schemes: %s", ", ".join(sorted(uploaders.keys())))
-    logger.info("new directory: %s", new_dir)
-    logger.info("completed directory: %s", completed_dir)
+    logger.info("spool directory: %s", args.spool_dir)
+    logger.info("completed directory: %s", args.completed_dir)
 
     if args.dest == "noop":
         args.dest = "noop://"
@@ -115,25 +113,25 @@ def upload_phase(args, spool_dir):
         raise SpoolToolError("unknown upload scheme '%s'" % args.dest)
 
     uploader = partial(uploaders[uri_parts.scheme], uri_parts)
-    for fname, mtime in find_files(new_dir, args.hold_for):
+    for fname, mtime in find_files(args.spool_dir, args.hold_for):
         logger.info(
             "discovered: %s, last modified %s",
             fname,
             datetime.utcfromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"),
         )
 
-        source_path = os.path.join(new_dir, fname)
-        completed_path = os.path.join(completed_dir, fname)
+        source_path = os.path.join(args.spool_dir, fname)
+        completed_path = os.path.join(args.completed_dir, fname)
 
         if args.format:
-            foutput = format(args.format, fname, os.stat(source_path), spool_dir)
+            foutput = format(args.format, fname, os.stat(source_path), args.spool_dir)
         else:
             foutput = fname
 
         try:
-            status = uploader(new_dir, fname, foutput)
+            status = uploader(args.spool_dir, fname, foutput)
         except Exception:
-            logger.exception("")
+            logger.exception("upload exception:")
             status = False
 
         if not status:
@@ -149,16 +147,12 @@ def upload_phase(args, spool_dir):
             continue
 
 
-def cleanup_phase(args, spool_dir):
+def cleanup_phase(args):
     logger.info("running cleanup...")
-    completed_dir = os.path.join(spool_dir, "completed")
-    if os.path.isdir(spool_dir):
-        # don't create the spool_dir if it doesn't already exist
-        os.makedirs(completed_dir, exist_ok=True)
 
-    for fname, mtime in find_files(completed_dir, args.delete_after):
+    for fname, mtime in find_files(args.completed_dir, args.delete_after):
         try:
-            abspath = os.path.join(completed_dir, fname)
+            abspath = os.path.join(args.completed_dir, fname)
             os.remove(abspath)
             logger.info("delete ok: %s", abspath)
         except:
@@ -170,9 +164,8 @@ def main(args):
     logger.info("running %s", vars(args))
     rounds = 0
     while True:
-        for spool_dir in args.spool_dir:
-            upload_phase(args, spool_dir)
-            cleanup_phase(args, spool_dir)
+        upload_phase(args)
+        cleanup_phase(args)
 
         if not args.loop:
             break
@@ -191,7 +184,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Watch directory and upload files to external location."
     )
-    parser.add_argument("spool_dir", help="spool directories", type=str, nargs="+")
+    parser.add_argument("--spool-dir", help="spool directorie", type=str, required=True)
+    parser.add_argument(
+        "--completed-dir", help="completed directory", type=str, required=True
+    )
     parser.add_argument(
         "--hold-for",
         help="wait for N minutes before uploading",
@@ -203,7 +199,7 @@ if __name__ == "__main__":
         "--delete-after",
         help="delete completed files after N minutes",
         type=int,
-        default=60,
+        default=24 * 60,
         required=False,
     )
     parser.add_argument("--dest", help="destination URI", type=str, required=True)
