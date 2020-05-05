@@ -77,3 +77,11 @@ following substitions:
 - now - Unix timestamp in integer seconds
 
 - spool_dir - Slash stripped SPOOL_DIR for the current file
+
+## Log Spooler
+
+`log_spooler` is a tool that takes stdin, prepends timestamps on a
+per-line basis, writes out log files to a spool directory, then
+rotates them on a specified time interval. It's useful for situations
+where ingestion programs don't want to maintain their own log rotation
+for spooling data.
