@@ -162,6 +162,17 @@ def cleanup_phase(args):
 
 def main(args):
     logger.info("running %s", vars(args))
+
+    if not os.path.isdir(args.spool_dir):
+        raise SpoolToolError(
+            "spool_dir %s does not exist or is not a directory" % args.spool_dir
+        )
+
+    if not os.path.isdir(args.completed_dir):
+        raise SpoolToolError(
+            "completed_dir %s does not exist or is not a directory" % args.completed_dir
+        )
+
     rounds = 0
     while True:
         upload_phase(args)
